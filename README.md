@@ -2,15 +2,15 @@
 
 <p>
 <img alt="Total number of available plugins" src="https://raw.githubusercontent.com/LNReader/lnreader-plugins/plugins/v3.0.0/total.svg">
-<img alt="Open plugin requests" src="https://img.shields.io/github/issues/lnreader/lnreader-plugins/Plugin%20Request?color=success&label=plugin%20requests">
-<img alt="Open bug reports" src="https://img.shields.io/github/issues/lnreader/lnreader-plugins/Bug?color=red&label=bugs">
+<img alt="Open plugin requests" src="https://img.shields.io/github/issues/lnreader/lnreader-plugins/plugin%20request?color=success&label=plugin%20requests">
+<img alt="Open bug reports" src="https://img.shields.io/github/issues/lnreader/lnreader-plugins/bug?color=red&label=bugs">
 </p>
 
 Community-driven plugin repository for [LNReader](https://github.com/LNReader/lnreader). This repository hosts plugins and manages related issues and requests.
 
 ## Quick Start
 
-**Prerequisites:** Node.js >= 20 
+**Prerequisites:** Node.js >= 22
 
 ```bash
 npm install
@@ -22,6 +22,7 @@ npm run dev:start
 - **[Quick Start Guide](./docs/quickstart.md)** - Create your first plugin
 - **[Plugin Development](./docs/docs.md)** - Complete API reference
 - **[Testing Guide](./docs/website-tutorial.md)** - Test plugins using the web interface
+- **[Live Check](./docs/testing.md)** - Required `npm run check:plugin` check before opening a PR
 - **[Komga Plugin](./docs/komga-plugin.md)** - Self-hosted server integration
 
 ## Testing Methods

@@ -1,8 +1,9 @@
 import { Parser } from 'htmlparser2';
-import { fetchApi } from '@libs/fetch';
+import { fetchApi, FetchInit } from '@libs/fetch';
 import { Plugin } from '@/types/plugin';
 import { NovelStatus } from '@libs/novelStatus';
 import { Filters } from '@libs/filterInputs';
+import { load } from 'cheerio';
 
 type ReadNovelFullOptions = {
   lang?: string;
@@ -23,6 +24,10 @@ type ReadNovelFullOptions = {
   noAjax?: boolean;
   noPages?: string[];
   pageAsPath?: boolean;
+  customJs?: string;
+  chapterListPaginated?: boolean;
+  imageReferer?: boolean;
+  listClass?: string;
 };
 
 export type ReadNovelFullMetadata = {
@@ -30,10 +35,10 @@ export type ReadNovelFullMetadata = {
   sourceSite: string;
   sourceName: string;
   options: ReadNovelFullOptions;
-  filters?: any;
+  filters?: Filters;
 };
 
-class ReadNovelFullPlugin implements Plugin.PluginBase {
+export class ReadNovelFullPlugin implements Plugin.PluginBase {
   id: string;
   name: string;
   icon: string;
@@ -41,6 +46,7 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
   version: string;
   options: ReadNovelFullOptions;
   filters?: Filters | undefined;
+  imageRequestInit?: Plugin.ImageRequestInit;
 
   constructor(metadata: ReadNovelFullMetadata) {
     this.id = metadata.id;
@@ -48,9 +54,16 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
     this.icon = `multisrc/readnovelfull/${metadata.id.toLowerCase()}/icon.png`;
     this.site = metadata.sourceSite;
     const versionIncrements = metadata.options?.versionIncrements || 0;
-    this.version = `2.1.${2 + versionIncrements}`;
+    this.version = `2.2.${1 + versionIncrements}`;
     this.options = metadata.options;
     this.filters = metadata.filters;
+    if (this.options?.imageReferer) {
+      this.imageRequestInit = {
+        headers: {
+          'Referer': this.site,
+        },
+      };
+    }
   }
 
   lastSearch: number | null = null;
@@ -65,6 +78,13 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
     let tempNovel: Partial<Plugin.NovelItem> = {};
     let depth: number;
 
+    const { listClass } = this.options;
+    const isListStart = (cls?: string) => {
+      if (!cls) return false;
+      if (listClass) return cls.split(/\s+/).includes(listClass);
+      return cls.includes('archive') || cls === 'col-content'; // legacy behaviour
+    };
+
     const stateStack: ParsingState[] = [ParsingState.Idle];
     const currentState = () => stateStack[stateStack.length - 1];
     const pushState = (state: ParsingState) => stateStack.push(state);
@@ -75,8 +95,8 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
       onopentag: (name, attribs) => {
         const state = currentState();
         if (
-          attribs.class?.includes('archive') ||
-          attribs.class === 'col-content'
+          isListStart(attribs.class) &&
+          (!listClass || state === ParsingState.Idle)
         ) {
           pushState(ParsingState.NovelList);
           depth = 0;
@@ -90,9 +110,16 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
 
         switch (name) {
           case 'img':
-            const cover = attribs['data-src'] || attribs.src;
-            if (cover) {
-              tempNovel.cover = new URL(cover, this.site).href;
+            {
+              const cover = [
+                attribs['data-src'],
+                attribs['data-cfsrc'],
+                attribs['data-original'],
+                attribs.src,
+              ].find(attr => attr && !attr.startsWith('data:'));
+              if (cover) {
+                tempNovel.cover = new URL(cover, this.site).href;
+              }
             }
             break;
           case 'h3':
@@ -139,9 +166,141 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
     return novels;
   }
 
+  // ===========================================================================
+  //                              HELPERS (chapter-list pagination)
+  // ===========================================================================
+
+  parseChapterListFragment(
+    html: string,
+    startIndex: number,
+  ): Plugin.ChapterItem[] {
+    const chapters: Plugin.ChapterItem[] = [];
+    let tempChapter: Partial<Plugin.ChapterItem> = {};
+    let i = startIndex;
+    let inChapter = false;
+
+    const parser = new Parser({
+      onopentag: (name, attribs) => {
+        if (name === 'a' && attribs.href) {
+          i++;
+          inChapter = true;
+          tempChapter.name = attribs.title || `Chapter ${i}`;
+          tempChapter.releaseTime = null;
+          tempChapter.chapterNumber = i;
+          tempChapter.path = attribs.href.startsWith('/')
+            ? attribs.href.substring(1)
+            : attribs.href;
+        }
+      },
+      onclosetag: name => {
+        if (name === 'a' && inChapter) {
+          if (tempChapter.name && tempChapter.path) {
+            chapters.push({ ...tempChapter } as Plugin.ChapterItem);
+          }
+          tempChapter = {};
+          inChapter = false;
+        }
+      },
+    });
+
+    parser.write(html);
+    parser.end();
+    return chapters;
+  }
+
+  async fetchAllChaptersViaJsonAjax(
+    novelPath: string,
+  ): Promise<Plugin.ChapterItem[]> {
+    const pageSize = 40;
+    const rateLimitState = { backoffUntil: 0 };
+
+    const first = await this.fetchChapterPageWithRetry(
+      novelPath,
+      1,
+      pageSize,
+      rateLimitState,
+    );
+    if (!first) {
+      return [];
+    }
+
+    const allChapters: Plugin.ChapterItem[] = [...first.chapters];
+    let fetchedPages = 1;
+
+    if (first.totalPages > 1) {
+      for (let page = 2; page <= first.totalPages; page++) {
+        const result = await this.fetchChapterPageWithRetry(
+          novelPath,
+          page,
+          pageSize,
+          rateLimitState,
+        );
+        if (result) {
+          allChapters.push(...result.chapters);
+          fetchedPages++;
+        }
+      }
+    }
+
+    return allChapters;
+  }
+
+  private async fetchChapterPageWithRetry(
+    novelPath: string,
+    page: number,
+    pageSize: number,
+    rateLimitState: { backoffUntil: number },
+  ): Promise<{ totalPages: number; chapters: Plugin.ChapterItem[] } | null> {
+    const url = `${this.site}${novelPath}?ajax=chapters&page=${page}&pageSize=${pageSize}`;
+    const maxAttempts = 3;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      // Wait out any rate-limit cooldown before sending.
+      const waitMs = rateLimitState.backoffUntil - Date.now();
+      if (waitMs > 0) {
+        await this.sleep(waitMs);
+      }
+
+      try {
+        const result = await fetchApi(url);
+        if (result.ok) {
+          const json = await result.json();
+          const chapters = this.parseChapterListFragment(
+            json.html || '',
+            (page - 1) * pageSize,
+          );
+          await this.sleep(150); // pacing delay — confirmed safe (zero 429s) across multiple runs/novels
+          return { totalPages: json.totalPage || 1, chapters };
+        }
+
+        if (result.status === 429) {
+          const retryAfterHeader = result.headers?.get?.('Retry-After');
+          const retryAfterMs = retryAfterHeader
+            ? Number(retryAfterHeader) * 1000
+            : 3000 * (attempt + 1); // fallback: 3s, 6s, 9s
+          const cooldownUntil = Date.now() + retryAfterMs;
+          // Only extend the cooldown, never shorten it
+          if (cooldownUntil > rateLimitState.backoffUntil) {
+            rateLimitState.backoffUntil = cooldownUntil;
+          }
+        } else {
+          await this.sleep(800 * (attempt + 1));
+        }
+      } catch (err) {
+        await this.sleep(800 * (attempt + 1));
+      }
+    }
+
+    return null;
+  }
+  // ============================================================================================
+
   async popularNovels(
     pageNo: number,
-    { filters, showLatestNovels }: Plugin.PopularNovelsOptions,
+    {
+      filters,
+      showLatestNovels,
+    }: Plugin.PopularNovelsOptions<typeof this.filters>,
   ): Promise<Plugin.NovelItem[]> {
     const {
       pageParam = 'page',
@@ -234,6 +393,8 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
     const infoParts: string[] = [];
     const chapters: Plugin.ChapterItem[] = [];
     let novelId: string | null = null;
+    let totalChapter: number | null = null;
+    let novelTitle: string | null = null;
     let tempChapter: Partial<Plugin.ChapterItem> = {};
     let i = 0;
     let depth: number;
@@ -256,6 +417,7 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
                 return;
               case 'inner':
               case 'desc-text':
+              case 'desc-text desc-text-collapsed':
                 if (state === ParsingState.Cover) popState();
                 pushState(ParsingState.Summary);
                 break;
@@ -267,12 +429,20 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
             if (!this.options.noAjax && attribs.id === 'rating') {
               novelId = attribs['data-novel-id'];
             }
+            if (attribs.id === 'indexListPage') {
+              novelId = attribs['data-novel-id'];
+              totalChapter = Number(attribs['data-total-chapters']);
+            }
             if (state === ParsingState.Info) depth++;
             break;
           case 'img':
             if (state === ParsingState.Cover) {
-              const cover =
-                attribs.src ?? attribs['data-cfsrc'] ?? attribs['data-src'];
+              const cover = [
+                attribs['data-src'],
+                attribs['data-cfsrc'],
+                attribs['data-original'],
+                attribs.src,
+              ].find(attr => attr && !attr.startsWith('data:'));
               const name = attribs.title;
               if (cover) {
                 novel.cover = new URL(cover, this.site).href;
@@ -299,6 +469,9 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
 
               if (newState) pushState(newState);
             }
+            if (attribs.class?.includes('disqus')) {
+              novelTitle = attribs['data-disqus-identifier'];
+            }
             break;
           case 'br':
             if (state === ParsingState.Summary) {
@@ -314,6 +487,9 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
             }
             break;
           case 'a':
+            if (attribs.class?.includes('set-case')) {
+              novelId = attribs['data-articleid'];
+            }
             if (state === ParsingState.ChapterList) {
               i++;
               const href = attribs.href;
@@ -326,6 +502,9 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
                 href?.substring(1) ||
                 novelPath.replace('.html', `/chapter-${i}.html`);
             }
+            break;
+          case 'script':
+            pushState(ParsingState.Hidden);
             break;
         }
       },
@@ -353,6 +532,12 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
           case ParsingState.Status:
             statusParts.push(text);
             break;
+          case ParsingState.Hidden:
+            if (text.includes('window.chapterPagination')) {
+              totalChapter = Number(text.match(/totalChapters:\s*(\d+)/)![1])!;
+            } else if (text.includes('sourceid')) {
+              novelId = text.match(/sourceid=(\d+)/)![1]!;
+            }
         }
       },
 
@@ -403,6 +588,9 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
                 break;
             }
             break;
+          case 'script':
+            if (state === ParsingState.Hidden) popState();
+            break;
           default:
             return;
         }
@@ -431,15 +619,17 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
                   novel.genres = detail;
                   break;
                 case 'status':
-                  const map: Record<string, string> = {
-                    ongoing: NovelStatus.Ongoing,
-                    hiatus: NovelStatus.OnHiatus,
-                    dropped: NovelStatus.Cancelled,
-                    cancelled: NovelStatus.Cancelled,
-                    completed: NovelStatus.Completed,
-                  };
-                  novel.status =
-                    map[detail.toLowerCase()] ?? NovelStatus.Unknown;
+                  {
+                    const map: Record<string, string> = {
+                      ongoing: NovelStatus.Ongoing,
+                      hiatus: NovelStatus.OnHiatus,
+                      dropped: NovelStatus.Cancelled,
+                      cancelled: NovelStatus.Cancelled,
+                      completed: NovelStatus.Completed,
+                    };
+                    novel.status =
+                      map[detail.toLowerCase()] ?? NovelStatus.Unknown;
+                  }
                   break;
                 default:
                   return;
@@ -465,21 +655,50 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
     parser.write(body);
     parser.end();
 
-    if (this.options.noAjax && chapters.length > 0) {
+    if (this.options.chapterListPaginated) {
+      novel.chapters = await this.fetchAllChaptersViaJsonAjax(novelPath);
+    } else if (this.options.noAjax && chapters.length > 0 && !totalChapter) {
       novel.chapters = chapters;
     } else if (novelId !== null) {
       const chapterListing =
         this.options.chapterListing || 'ajax/chapter-archive';
       const ajaxParam = this.options.chapterParam || 'novelId';
       const params = new URLSearchParams({ [ajaxParam]: novelId });
-      const chaptersUrl = `${this.site}${chapterListing}?${params.toString()}`;
 
-      const ajaxResult = await fetchApi(chaptersUrl);
+      let chaptersUrl: string;
+      let fetchOptions: FetchInit | undefined;
+
+      if (totalChapter) {
+        chaptersUrl = `${this.site}${chapterListing}`;
+        params.set('acode', novelTitle || novelPath.split('/').pop()!);
+        params.set('cid', String(Math.floor(Math.random() * totalChapter)));
+        fetchOptions = {
+          method: 'POST',
+          body: params.toString(),
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+        };
+      } else {
+        chaptersUrl = `${this.site}${chapterListing}?${params.toString()}`;
+      }
+
+      const ajaxResult = await fetchApi(chaptersUrl, fetchOptions);
       if (!ajaxResult.ok) {
         console.error(`Failed to fetch chapters: ${ajaxResult.status}`);
         novel.chapters = [];
       } else {
         const ajaxBody = await ajaxResult.text();
+        let ajaxHtml = ajaxBody;
+        try {
+          const json = JSON.parse(ajaxBody);
+          if (typeof json.html === 'string') {
+            ajaxHtml = json.html;
+          }
+        } catch {
+          // eslint
+        }
         const ajaxChapters: Plugin.ChapterItem[] = [];
         let tempAjaxChapter: Partial<Plugin.ChapterItem> = {};
 
@@ -499,8 +718,10 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
             }
 
             if (chapterHref !== undefined) {
-              const href = new URL(chapterHref, this.site);
-              tempAjaxChapter.path = href.pathname.substring(1);
+              const path = new URL(chapterHref, this.site).pathname.substring(
+                1,
+              );
+              tempAjaxChapter.path = path;
               tempAjaxChapter.name = initialName;
             }
           },
@@ -534,7 +755,7 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
           },
         });
 
-        ajaxParser.write(ajaxBody);
+        ajaxParser.write(ajaxHtml);
         ajaxParser.end();
         novel.chapters = ajaxChapters;
       }
@@ -545,7 +766,17 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
 
   async parseChapter(chapterPath: string): Promise<string> {
     const response = await fetchApi(this.site + chapterPath);
-    const html = await response.text();
+    let html = await response.text();
+    if (this.options?.customJs) {
+      try {
+        const $ = load(html);
+        // CustomJS HERE
+        html = $.html();
+      } catch (error) {
+        console.error('Error executing customJs:', error);
+        throw error;
+      }
+    }
 
     let depth: number;
     let depthHide: number;
@@ -559,18 +790,17 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
     const popState = () =>
       stateStack.length > 1 ? stateStack.pop() : currentState();
 
-    type EscapeChar = '&' | '<' | '>' | '"' | "'" | ' ';
-    const escapeRegex = /[&<>"' ]/g;
-    const escapeMap: Record<EscapeChar, string> = {
+    const escapeMap: Record<string, string> = {
       '&': '&amp;',
       '<': '&lt;',
       '>': '&gt;',
       '"': '&quot;',
       "'": '&#39;',
-      ' ': '&nbsp;',
+      ' ': '&nbsp;',
+      '\u200C': '', // this is probably a breaking change, report if paragraphs look weird
     };
-    const escapeHtml = (text: string): string =>
-      text.replace(escapeRegex, char => escapeMap[char as EscapeChar]);
+    const escapeHtml = (text: string) =>
+      text.replace(/[&<>"'\xA0\u200C]/g, char => escapeMap[char]);
 
     const parser = new Parser({
       onopentag(name, attribs) {
@@ -588,7 +818,7 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
             }
             break;
           case ParsingState.Chapter:
-            if (name === 'sub') {
+            if (name === 'sub' || name === 'iframe') {
               pushState(ParsingState.Hidden);
             } else if (name === 'div') {
               depth++;
@@ -641,7 +871,8 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
 
       ontext(text) {
         if (currentState() === ParsingState.Chapter) {
-          chapterHtml.push(escapeHtml(text));
+          const data = escapeHtml(text);
+          chapterHtml.push(data.trim().replace(/\s\s+/, ' '));
         }
       },
 
@@ -649,7 +880,7 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
         const state = currentState();
 
         if (state === ParsingState.Hidden) {
-          if (name === 'sub') {
+          if (name === 'sub' || name === 'iframe') {
             popState();
           } else if (name === 'div') {
             depthHide--;
@@ -714,7 +945,7 @@ class ReadNovelFullPlugin implements Plugin.PluginBase {
 
     const url = `${this.site}${searchPage}${!postSearch ? `?${params.toString()}` : ''}`;
 
-    const fetchOptions: RequestInit | undefined = postSearch
+    const fetchOptions: FetchInit | undefined = postSearch
       ? {
           method: 'POST',
           body: params.toString(),

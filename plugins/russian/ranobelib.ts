@@ -29,7 +29,7 @@ class RLIB implements Plugin.PluginBase {
   name = 'RanobeLib';
   site = 'https://ranobelib.me';
   apiSite = 'https://api.cdnlibs.org/api/manga/';
-  version = '2.2.2';
+  version = '2.2.6';
   icon = 'src/ru/ranobelib/icon.png';
   webStorageUtilized = true;
   imageRequestInit = {
@@ -120,7 +120,12 @@ class RLIB implements Plugin.PluginBase {
       path: novelPath,
       name: data.rus_name || data.name,
       cover: data.cover?.default || defaultCover,
-      summary: data.summary?.trim(),
+      summary:
+        typeof data.summary === 'string'
+          ? data.summary.trim()
+          : data.summary?.type === 'doc'
+            ? jsonToHtml(data.summary.content, [])
+            : undefined,
     };
 
     if (data.status?.id) {
@@ -156,46 +161,23 @@ class RLIB implements Plugin.PluginBase {
     ).then(res => res.json());
 
     if (chaptersJSON.data?.length) {
-      let chapters: Plugin.ChapterItem[] = chaptersJSON.data.flatMap(chapter =>
-        chapter.branches.map(({ branch_id, created_at }) => {
-          const bId = String(branch_id ?? '0');
-          return {
-            name: `Том ${chapter.volume} Глава ${chapter.number}${
-              chapter.name ? ' ' + chapter.name.trim() : ''
-            }`,
-            path: `${novelPath}/${chapter.volume}/${chapter.number}/${bId}`,
-            releaseTime: created_at ? dayjs(created_at).format('LLL') : null,
-            chapterNumber: chapter.index,
-            page: branch_name[bId] || 'Неизвестный',
-          };
-        }),
+      const chapters: Plugin.ChapterItem[] = chaptersJSON.data.flatMap(
+        chapter =>
+          chapter.branches.map(({ branch_id, created_at }) => {
+            const bId = String(branch_id ?? '0');
+            return {
+              name: `Том ${chapter.volume} Глава ${chapter.number}${
+                chapter.name ? ' ' + chapter.name.trim() : ''
+              }`,
+              path: `${novelPath}/${chapter.volume}/${chapter.number}/${bId}`,
+              releaseTime: created_at ? dayjs(created_at).format('LLL') : null,
+              chapterNumber: chapter.index,
+              scanlator: branch_name[bId] || 'Неизвестный',
+            };
+          }),
       );
 
       if (chapters.length) {
-        const uniquePages = new Set(chapters.map(c => c.page));
-
-        if (uniquePages.size === 1) {
-          // If only one unique page value, set page to undefined for all chapters
-          // Need more investigation one app side for single page shenanigans
-          chapters = chapters.map(chapter => ({
-            ...chapter,
-            page: undefined,
-          }));
-        } else if (data.teams?.length > 1) {
-          // Original sorting logic for multiple pages, for reasons chapters overlap with one another
-          chapters.sort((chapterA, chapterB) => {
-            if (
-              chapterA.page &&
-              chapterB.page &&
-              chapterA.page !== chapterB.page
-            ) {
-              return chapterA.page.localeCompare(chapterB.page);
-            }
-            return (
-              (chapterA.chapterNumber || 0) - (chapterB.chapterNumber || 0)
-            );
-          });
-        }
         novel.chapters = chapters;
       }
     }
@@ -204,33 +186,37 @@ class RLIB implements Plugin.PluginBase {
 
   async parseChapter(chapterPath: string): Promise<string> {
     const [slug, volume, number, branch_id] = chapterPath.split('/');
-    let chapterText = '';
-
-    if (slug && volume && number) {
-      const result: { data: DataClass } = await fetchApi(
-        this.apiSite +
-          slug +
-          '/chapter?' +
-          (branch_id ? 'branch_id=' + branch_id + '&' : '') +
-          'number=' +
-          number +
-          '&volume=' +
-          volume,
-        { headers: this.getHeaders() },
-      ).then(res => res.json());
-      chapterText =
-        result?.data?.content?.type == 'doc'
-          ? jsonToHtml(
-              result.data.content.content,
-              result.data.attachments || [],
-            )
-          : result?.data?.content;
+    if (!slug || !volume || !number) {
+      throw new Error(`Invalid chapter path: ${chapterPath}`);
+    }
+    const url =
+      this.apiSite +
+      slug +
+      '/chapter?' +
+      (branch_id ? 'branch_id=' + branch_id + '&' : '') +
+      'number=' +
+      number +
+      '&volume=' +
+      volume;
+    const res = await fetchApi(url, { headers: this.getHeaders() });
+    if (!res.ok) {
+      throw new Error(`Could not load chapter (HTTP ${res.status})`);
+    }
+    const result: { data: DataClass } = await res.json();
+    const content = result?.data?.content;
+    const chapterText =
+      typeof content === 'object' && content?.type === 'doc'
+        ? jsonToHtml(content.content, result.data.attachments || [])
+        : (content as string) || '';
+    if (!chapterText) {
+      throw new Error('Could not load chapter');
     }
     return chapterText;
   }
 
   async searchNovels(searchTerm: string): Promise<Plugin.NovelItem[]> {
-    const url = this.apiSite + '?site_id[0]=3&q=' + searchTerm;
+    const url =
+      this.apiSite + '?site_id[0]=3&q=' + encodeURIComponent(searchTerm);
     const result: TopLevel = await fetchApi(url, {
       headers: this.getHeaders(),
     }).then(res => res.json());
@@ -272,7 +258,8 @@ class RLIB implements Plugin.PluginBase {
   };
 
   getUser = () => {
-    const user = storage.get('user');
+    const user = storage.get('user') as
+      { token: string; id: number } | undefined;
     if (user) {
       return { token: { Authorization: 'Bearer ' + user.token }, ui: user.id };
     }
@@ -658,7 +645,7 @@ type AgeRestriction = {
 
 type Branch = {
   id: number;
-  branch_id: null;
+  branch_id: number | null;
   created_at: string;
   teams: BranchTeam[];
   user: User;
@@ -695,7 +682,7 @@ type DataClass = {
   ageRestriction?: AgeRestriction;
   site?: number;
   type: string;
-  summary?: string;
+  summary?: string | { type: string; content: HTML[] };
   is_licensed?: boolean;
   teams: DataTeam[];
   genres?: Genre[];
@@ -714,7 +701,7 @@ type DataClass = {
   created_at?: string;
   moderated?: AgeRestriction;
   likes_count?: number;
-  content?: any;
+  content?: string | { type: string; content: HTML[] };
   attachments?: Attachment[];
 };
 
