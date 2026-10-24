@@ -57,15 +57,6 @@
     }
   },
   {
-    "id": "novelsparadise",
-    "sourceSite": "https://novelsparadise.site/",
-    "sourceName": "Novels Paradise",
-    "options": {
-      "lang": "Arabic",
-      "reverseChapters": true
-    }
-  },
-  {
     "id": "universalnovel",
     "sourceSite": "https://universalnovel.com/",
     "sourceName": "Universal Novel",
